@@ -6,9 +6,14 @@ import (
 	"net"
 	"os"
 
+	"github.com/golang/glog"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+)
+
+const (
+	nodeIPAnnotation = "kube-router.io/nodeip"
 )
 
 // GetNodeObject returns the node API object for the node
@@ -45,6 +50,15 @@ func GetNodeObject(clientset kubernetes.Interface, hostnameOverride string) (*ap
 // 1. NodeInternalIP
 // 2. NodeExternalIP (Only set on cloud providers usually)
 func GetNodeIP(node *apiv1.Node) (net.IP, error) {
+
+	if nodeIP, ok := node.ObjectMeta.Annotations[nodeIPAnnotation]; ok {
+		nodeIPParsed := net.ParseIP(nodeIP)
+		if nodeIPParsed != nil {
+			return net.ParseIP(nodeIP), nil
+		}
+		glog.Warningf("Could not parse nodeIP annotation, ignoring.")
+	}
+
 	addresses := node.Status.Addresses
 	addressMap := make(map[apiv1.NodeAddressType][]apiv1.NodeAddress)
 	for i := range addresses {
