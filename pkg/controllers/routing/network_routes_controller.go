@@ -40,18 +40,24 @@ const (
 	podSubnetsIPSetName  = "kube-router-pod-subnets"
 	nodeAddrsIPSetName   = "kube-router-node-ips"
 
-	nodeASNAnnotation                 = "kube-router.io/node.asn"
-	pathPrependASNAnnotation          = "kube-router.io/path-prepend.as"
-	pathPrependRepeatNAnnotation      = "kube-router.io/path-prepend.repeat-n"
-	peerASNAnnotation                 = "kube-router.io/peer.asns"
-	peerIPAnnotation                  = "kube-router.io/peer.ips"
-	peerPasswordAnnotation            = "kube-router.io/peer.passwords"
-	peerPortAnnotation                = "kube-router.io/peer.ports"
-	rrClientAnnotation                = "kube-router.io/rr.client"
-	rrServerAnnotation                = "kube-router.io/rr.server"
-	svcLocalAnnotation                = "kube-router.io/service.local"
-	bgpLocalAddressAnnotation         = "kube-router.io/bgp-local-addresses"
-	LeaderElectionRecordAnnotationKey = "control-plane.alpha.kubernetes.io/leader"
+	nodeASNAnnotation                  = "kube-router.io/node.asn"
+	pathPrependASNAnnotation           = "kube-router.io/path-prepend.as"
+	pathPrependRepeatNAnnotation       = "kube-router.io/path-prepend.repeat-n"
+	peerASNAnnotation                  = "kube-router.io/peer.asns"
+	peerIPAnnotation                   = "kube-router.io/peer.ips"
+	peerPasswordAnnotation             = "kube-router.io/peer.passwords"
+	peerPortAnnotation                 = "kube-router.io/peer.ports"
+	rrClientAnnotation                 = "kube-router.io/rr.client"
+	rrServerAnnotation                 = "kube-router.io/rr.server"
+	svcLocalAnnotation                 = "kube-router.io/service.local"
+	bgpLocalAddressAnnotation          = "kube-router.io/bgp-local-addresses"
+	svcAdvertiseClusterAnnotation      = "kube-router.io/service.advertise.clusterip"
+	svcAdvertiseExternalAnnotation     = "kube-router.io/service.advertise.externalip"
+	svcAdvertiseLoadBalancerAnnotation = "kube-router.io/service.advertise.loadbalancerip"
+	LeaderElectionRecordAnnotationKey  = "control-plane.alpha.kubernetes.io/leader"
+
+	// Deprecated: use kube-router.io/service.advertise.loadbalancer instead
+	svcSkipLbIpsAnnotation = "kube-router.io/service.skiplbips"
 )
 
 // NetworkRoutingController is struct to hold necessary information required by controller
@@ -199,7 +205,13 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 		glog.Errorf("Failed to enable netfilter for bridge. Network policies and service proxy may not work: %s", err.Error())
 	}
 	if err = ioutil.WriteFile("/proc/sys/net/bridge/bridge-nf-call-iptables", []byte(strconv.Itoa(1)), 0640); err != nil {
-		glog.Errorf("Failed to enable netfilter for bridge. Network policies and service proxy may not work: %s", err.Error())
+		glog.Errorf("Failed to enable iptables for bridge. Network policies and service proxy may not work: %s", err.Error())
+	}
+	if nrc.isIpv6 {
+		if err = ioutil.WriteFile("/proc/sys/net/bridge/bridge-nf-call-ip6tables", []byte(strconv.Itoa(1)), 0640); err != nil {
+			glog.Errorf("Failed to enable ip6tables for bridge. Network policies and service proxy may not work: %s", err.Error())
+		}
+
 	}
 
 	t := time.NewTicker(nrc.syncPeriod)
@@ -248,6 +260,12 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 			if err != nil {
 				glog.Errorf("Error synchronizing ipsets: %s", err.Error())
 			}
+		}
+
+		// enable IP forwarding for the packets coming in/out from the pods
+		err = nrc.enableForwarding()
+		if err != nil {
+			glog.Errorf("Failed to enable IP forwarding of traffic from pods: %s", err.Error())
 		}
 
 		// advertise or withdraw IPs for the services to be reachable via host
@@ -325,7 +343,7 @@ func (nrc *NetworkRoutingController) watchBgpUpdates() {
 			case *gobgp.WatchEventBestPath:
 				glog.V(3).Info("Processing bgp route advertisement from peer")
 				if nrc.MetricsEnabled {
-					metrics.ControllerBGPadvertisementsReceived.WithLabelValues().Add(float64(1))
+					metrics.ControllerBGPadvertisementsReceived.Inc()
 				}
 				for _, path := range msg.PathList {
 					if path.IsLocal() {
@@ -342,6 +360,9 @@ func (nrc *NetworkRoutingController) watchBgpUpdates() {
 }
 
 func (nrc *NetworkRoutingController) advertisePodRoute() error {
+	if nrc.MetricsEnabled {
+		metrics.ControllerBGPadvertisementsSent.Inc()
+	}
 	cidr, err := utils.GetPodCidrFromNodeSpec(nrc.clientset, nrc.hostnameOverride)
 	if err != nil {
 		return err
@@ -350,18 +371,43 @@ func (nrc *NetworkRoutingController) advertisePodRoute() error {
 	cidrStr := strings.Split(cidr, "/")
 	subnet := cidrStr[0]
 	cidrLen, _ := strconv.Atoi(cidrStr[1])
-	attrs := []bgp.PathAttributeInterface{
-		bgp.NewPathAttributeOrigin(0),
-		bgp.NewPathAttributeNextHop(nrc.nodeIP.String()),
+	if nrc.isIpv6 {
+		prefixes := []bgp.AddrPrefixInterface{bgp.NewIPv6AddrPrefix(uint8(cidrLen), subnet)}
+		attrs := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_IGP),
+			// This requires some research.
+			// For ipv6 what should be next-hop value? According to	 this https://www.noction.com/blog/bgp-next-hop
+			// using the link-local	 address may be more appropriate.
+			bgp.NewPathAttributeMpReachNLRI(nrc.nodeIP.String(), prefixes),
+			&bgp.PathAttributeNextHop{
+				PathAttribute: bgp.PathAttribute{
+					Flags:  bgp.PathAttrFlags[bgp.BGP_ATTR_TYPE_NEXT_HOP],
+					Type:   bgp.BGP_ATTR_TYPE_NEXT_HOP,
+					Length: 16,
+				},
+				Value: nrc.nodeIP,
+			},
+		}
+
+		glog.V(2).Infof("Advertising route: '%s/%s via %s' to peers using attribute: %+q", subnet, strconv.Itoa(cidrLen), nrc.nodeIP.String(), attrs)
+
+		if _, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, bgp.NewIPv6AddrPrefix(uint8(cidrLen),
+			subnet), false, attrs, time.Now(), false)}); err != nil {
+			return fmt.Errorf(err.Error())
+		}
+	} else {
+		attrs := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeNextHop(nrc.nodeIP.String()),
+		}
+
+		glog.V(2).Infof("Advertising route: '%s/%s via %s' to peers", subnet, strconv.Itoa(cidrLen), nrc.nodeIP.String())
+
+		if _, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, bgp.NewIPAddrPrefix(uint8(cidrLen),
+			subnet), false, attrs, time.Now(), false)}); err != nil {
+			return fmt.Errorf(err.Error())
+		}
 	}
-
-	glog.V(2).Infof("Advertising route: '%s/%s via %s' to peers", subnet, strconv.Itoa(cidrLen), nrc.nodeIP.String())
-
-	if _, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, bgp.NewIPAddrPrefix(uint8(cidrLen),
-		subnet), false, attrs, time.Now(), false)}); err != nil {
-		return fmt.Errorf(err.Error())
-	}
-
 	return nil
 }
 
@@ -486,6 +532,12 @@ func (nrc *NetworkRoutingController) Cleanup() {
 }
 
 func (nrc *NetworkRoutingController) syncNodeIPSets() error {
+	start := time.Now()
+	defer func() {
+		if nrc.MetricsEnabled {
+			metrics.ControllerRoutesSyncTime.Observe(time.Since(start).Seconds())
+		}
+	}()
 	// Get the current list of the nodes from API server
 	nodes, err := nrc.clientset.CoreV1().Nodes().List(metav1.ListOptions{})
 	if err != nil {
@@ -559,7 +611,7 @@ func (nrc *NetworkRoutingController) enableForwarding() error {
 		return fmt.Errorf("Failed to run iptables command: %s", err.Error())
 	}
 	if !exists {
-		err := iptablesCmdHandler.AppendUnique("filter", "FORWARD", args...)
+		err := iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
 		if err != nil {
 			return fmt.Errorf("Failed to run iptables command: %s", err.Error())
 		}
@@ -572,7 +624,7 @@ func (nrc *NetworkRoutingController) enableForwarding() error {
 		return fmt.Errorf("Failed to run iptables command: %s", err.Error())
 	}
 	if !exists {
-		err = iptablesCmdHandler.AppendUnique("filter", "FORWARD", args...)
+		err = iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
 		if err != nil {
 			return fmt.Errorf("Failed to run iptables command: %s", err.Error())
 		}
@@ -585,7 +637,7 @@ func (nrc *NetworkRoutingController) enableForwarding() error {
 		return fmt.Errorf("Failed to run iptables command: %s", err.Error())
 	}
 	if !exists {
-		err = iptablesCmdHandler.AppendUnique("filter", "FORWARD", args...)
+		err = iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
 		if err != nil {
 			return fmt.Errorf("Failed to run iptables command: %s", err.Error())
 		}
@@ -786,6 +838,7 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 		prometheus.MustRegister(metrics.ControllerBGPadvertisementsReceived)
 		prometheus.MustRegister(metrics.ControllerBGPInternalPeersSyncTime)
 		prometheus.MustRegister(metrics.ControllerBPGpeers)
+		prometheus.MustRegister(metrics.ControllerRoutesSyncTime)
 		nrc.MetricsEnabled = true
 	}
 
